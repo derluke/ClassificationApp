@@ -1,22 +1,30 @@
 import base64
 import os
+import time
 from enum import Enum
 from pathlib import Path
 
+import altair as alt
+import datarobot as dr
+import deployment_patch
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
 from deep_translator import GoogleTranslator
 from dotenv import load_dotenv
+from langchain.callbacks import get_openai_callback
 from langchain.chat_models import AzureChatOpenAI
 from langchain.output_parsers import PydanticOutputParser
 from langchain.prompts import PromptTemplate
+from langchain.schema import Document
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+import csv
+
 from PIL import Image
 from pydantic import BaseModel  # pylint: disable=no-name-in-module
-import datarobot as dr
-import altair as alt
-import deployment_patch
+from tqdm import tqdm
 
 load_dotenv()
 
@@ -83,7 +91,10 @@ def color_text(text, segments):
         alpha = segment["strength"] / 2
 
         # Append colored text
-        colored_text += f"<span style='background-color: rgba{base_color + (alpha,)}; color: white; font-size: 1.5em'>{text[start:end+1]}</span>"
+        colored_text += (
+            f"<span style='background-color: rgba{base_color + (alpha,)}; "
+            f"color: white; font-size: 1.5em'>{text[start:end+1]}</span>"
+        )
 
         last_end = end + 1
 
@@ -120,12 +131,33 @@ def setup_llm():
         openai_api_key=OPENAI_API_KEY,
         openai_organization=OPENAI_ORGANIZATION,
         model_name=OPENAI_DEPLOYMENT_NAME,
-        temperature=0.2,
+        temperature=0.4,
         verbose=True,
         max_retries=0,
         request_timeout=20,
     )
     return llm
+
+
+def setup_embedding():
+    OPENAI_API_BASE = os.environ["OPENAI_API_BASE"]
+    OPENAI_ORGANIZATION = os.environ["OPENAI_ORGANIZATION"]
+    OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+    OPENAI_API_TYPE = os.environ["OPENAI_API_TYPE"]
+    OPENAI_API_VERSION = os.environ["OPENAI_API_VERSION"]
+    OPENAI_DEPLOYMENT_NAME = os.environ["OPENAI_EMBEDDING_DEPLOYMENT_NAME"]
+
+    embedding = OpenAIEmbeddings(
+        deployment=OPENAI_DEPLOYMENT_NAME,
+        openai_api_type=OPENAI_API_TYPE,
+        openai_api_base=OPENAI_API_BASE,
+        openai_api_version=OPENAI_API_VERSION,
+        openai_api_key=OPENAI_API_KEY,
+        openai_organization=OPENAI_ORGANIZATION,
+        max_retries=0,
+        request_timeout=20,
+    )
+    return embedding
 
 
 raw_industry_classification_df = pd.read_csv("data/GICSMap2023.csv")
@@ -214,6 +246,44 @@ def create_enum(name, values):
 industry_classification_df = prep_hierarchy_table(raw_industry_classification_df)
 
 
+def setup_kb(df):
+    # FAISS database:
+    # faiss_db = FAISS()
+    embeddings = setup_embedding()
+
+    try:
+        db = FAISS.load_local(
+            "data/industry_classification.faiss", embeddings=embeddings
+        )
+    except Exception:  # pylint: disable=broad-except
+        print("Building FAISS database")
+        # read rows of dataframe into list of dictionaries:
+        rows = df.to_dict(orient="records")
+        # convert eacxh row into readable text:
+        texts = [
+            Document(
+                page_content=(
+                    f'Sector: "{row["Sector"]}"->IndustryGroup: "{row["IndustryGroup"]}"'
+                    f'->Industry: "{row["Industry"]}"->SubIndustry: "{row["SubIndustry"]}" '
+                    f'Description: {row["description"]}'
+                )
+            )
+            for row in rows
+        ]
+
+        batch = 16
+        db = FAISS.from_documents(texts[:batch], embeddings)
+        # get embedding model
+
+        for i in tqdm(range(batch, len(texts), batch)):
+            sample_docs = texts[i : i + batch]  # noqa: E203
+            db.add_documents(sample_docs)
+            time.sleep(2)  # embarrassing but works
+        db = FAISS.from_documents(texts, embeddings)
+        db.save_local("data/industry_classification.faiss")
+    return db
+
+
 fig2 = px.sunburst(
     industry_classification_df,
     path=["Sector", "IndustryGroup", "Industry", "SubIndustry"],
@@ -257,6 +327,40 @@ class SubIndustryModel(BaseModel):
     sub_industry: SubIndustryEnum
 
 
+def get_filtered_sub_industry(candidates):
+    candidates_sub_industry = [
+        candidate.metadata["SubIndustry"] for candidate in candidates
+    ]
+    FilteredSubIndustryEnum = create_enum(
+        "SubIndustry",
+        {
+            sub_industry.upper(): sub_industry
+            for sub_industry in candidates_sub_industry
+        },
+    )
+
+    class FilteredSubIndustryModel(BaseModel):
+        sub_industry: FilteredSubIndustryEnum
+
+    filtered_sub_industry_parser = PydanticOutputParser(
+        pydantic_object=FilteredSubIndustryModel
+    )
+
+    filtered_sub_industry_classification_prompt = PromptTemplate(
+        template=(
+            "This is a classification task. Please classify the following text into its most likely SubIndustry "
+            "picking only from the enum values below. If the text is not in English, translate it into English first, "
+            "and then pick the most likely value from the enum below. This is the text: \n"
+            "{text}\n\n{format_instructions}"
+        ),
+        input_variables=["text"],
+        partial_variables={
+            "format_instructions": filtered_sub_industry_parser.get_format_instructions()
+        },
+    )
+    return filtered_sub_industry_parser, filtered_sub_industry_classification_prompt
+
+
 sector_parser = PydanticOutputParser(pydantic_object=SectorModel)
 industry_group_parser = PydanticOutputParser(pydantic_object=IndustryGroupModel)
 industry_parser = PydanticOutputParser(pydantic_object=IndustryModel)
@@ -265,7 +369,8 @@ sub_industry_parser = PydanticOutputParser(pydantic_object=SubIndustryModel)
 
 sector_classification_prompt = PromptTemplate(
     template=(
-        "This is a classification task. Please classify the following text into its most likely industry: "
+        "This is a classification task. Please classify the following text into its most likely sector picking "
+        "only from the following options: "
         "{text}\n\n{format_instructions}"
     ),
     input_variables=["text"],
@@ -274,7 +379,8 @@ sector_classification_prompt = PromptTemplate(
 
 industry_group_classification_prompt = PromptTemplate(
     template=(
-        "This is a classification task. Please classify the following text into its most likely industry: "
+        "This is a classification task. Please classify the following text into its most likely industry group "
+        "picking only from the following options: "
         "{text}\n\n{format_instructions}"
     ),
     input_variables=["text"],
@@ -285,7 +391,8 @@ industry_group_classification_prompt = PromptTemplate(
 
 industry_classification_prompt = PromptTemplate(
     template=(
-        "This is a classification task. Please classify the following text into its most likely industry: "
+        "This is a classification task. Please classify the following text into its most likely industry picking only "
+        "from the following options: "
         "{text}\n\n{format_instructions}"
     ),
     input_variables=["text"],
@@ -296,7 +403,8 @@ industry_classification_prompt = PromptTemplate(
 
 sub_industry_classification_prompt = PromptTemplate(
     template=(
-        "This is a classification task. Please classify the following text into its most likely industry: "
+        "This is a classification task. Please classify the following text into its most likely SubIndustry "
+        "picking only from the following options: "
         "{text}\n\n{format_instructions}"
     ),
     input_variables=["text"],
@@ -305,10 +413,11 @@ sub_industry_classification_prompt = PromptTemplate(
     },
 )
 
+
 llm = setup_llm()
 
 
-def get_classification(text):
+def get_classification(text, verbose=True):
     """
     Get the industry classification for text.
     This is a simple algorithm that first tries to classify the text into a industry, then a sub industry.
@@ -320,26 +429,49 @@ def get_classification(text):
     Returns:
         None
     """
+    db = setup_kb(industry_classification_df)
+
+    result = None
     for _ in range(3):
         output = llm.predict(industry_classification_prompt.format(text=text))
         try:
             result = industry_parser.parse(output)
-        except:
-            st.warning(f"retrying - found {output}")
-            output = llm.predict(sub_industry_classification_prompt.format(text=text))
-            try:
-                result = sub_industry_parser.parse(output)
-            except:
+        except:  # pylint: disable=bare-except
+            if verbose:
                 st.warning(f"retrying - found {output}")
+            candidates = db.similarity_search(text, k=5)
+            (
+                filtered_sub_industry_parser,
+                filtered_sub_industry_classification_prompt,
+            ) = get_filtered_sub_industry(candidates)
+            # st.warning(
+            #     f"candidates: {[candidate.page_content for candidate in candidates]}"
+            # )
+            # st.warning(
+            #     f"instructions = {filtered_sub_industry_parser.get_format_instructions()}"
+            # )
+            # st.warning(
+            #     f"prompt = {filtered_sub_industry_classification_prompt.format(text=text)}"
+            # )
+            output = llm.predict(
+                filtered_sub_industry_classification_prompt.format(text=text)
+            )
+            try:
+                result = filtered_sub_industry_parser.parse(output)
+            except:
+                if verbose:
+                    st.warning(f"retrying - found {output}")
                 continue
             else:
                 break
         else:
             break
     else:
-        st.error("failed to get valid output")
-
-    st.success(result)
+        if verbose:
+            st.error("failed to get valid output")
+    if verbose:
+        st.success(result)
+    return result
 
 
 with st.expander("Industry Classification Table"):
@@ -347,6 +479,43 @@ with st.expander("Industry Classification Table"):
 
 with st.expander("Industry Classification Chart"):
     st.plotly_chart(fig2, use_container_width=True)
+
+# batch classification on uploaded csv
+uploaded_file = st.file_uploader("Upload a CSV file", type="csv")
+if uploaded_file is not None:
+    # select the column with the relevant input:
+    uploaded_file = pd.read_csv(uploaded_file)
+    text_column = st.selectbox(
+        "Select the column with the text to classify", uploaded_file.columns
+    )
+    if st.button("Classify", key="batch_classify"):
+        # iterate through the rows and classify each text:
+        all_results = []
+        progress_text = "Please wait."
+        progress_bar = st.progress(0, text=progress_text)
+        with st.spinner("Classifying..."):
+            with get_openai_callback() as cb:
+                for i, row in enumerate(uploaded_file[text_column]):
+                    result = get_classification(row, verbose=False)
+                    all_results.append(str(result) if result else "failed")
+                    percent_complete = int((i + 1) / len(uploaded_file) * 100)
+                    progress_bar.progress(percent_complete, text=progress_text)
+
+        st.write(cb)
+        # create a new column with the results:
+        uploaded_file["classification"] = all_results
+        # show the results:
+        st.write(uploaded_file)
+        # provide download link:
+        csv = uploaded_file.astype(str).to_csv(
+            index=False, encoding="utf-8", sep="|", quotechar='"', quoting=csv.QUOTE_ALL
+        )
+        b64 = base64.b64encode(
+            csv.encode()
+        ).decode()  # some strings <-> bytes conversions necessary here
+        href = f'<a href="data:file/csv;base64,{b64}">Download csv file</a>'
+        st.markdown(href, unsafe_allow_html=True)
+
 
 text = st.text_area("Text to classify", height=200)
 if st.button("Classify"):
@@ -388,6 +557,7 @@ if st.button("Classify"):
     )
 
     segments = preds["Explanation 1 perNgramTextExplanations"].values[0]
+    # st.warning(segments)
     colored_output = color_text(text, segments)
     predicted_value = predictions_sorted.iloc[0].label
     st.markdown(f'### Explanation for predicted value: "{predicted_value}"')
